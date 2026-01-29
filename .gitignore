@@ -1,0 +1,15 @@
+# Cache
+__pycache_/
+
+# Resulting files
+*.csv
+*.txt
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Environments
+.env
+.envrc
+.venv
