@@ -1,3 +1,4 @@
+import re
 import csv
 import math
 import tkinter as tk
@@ -5,13 +6,15 @@ import tkinter.font as tkfont
 
 from pathlib import Path
 from typing import Callable
+from collections import Counter, defaultdict
 from tkinter import filedialog, messagebox, ttk
+
 
 
 # Define the absolute order of the txt (23 fields)
 TARGET_COLUMNS: list[str] = [
     "TipoTercero", "TipoOperacion", "RFCProveedor", "NIF", "NombreExtranjero", "Pais",
-    "JurisdiccionFiscal", "ValorTotal", "IVANoAcreditable", "ValorIVA11", "IVAPagado11",
+    "JurisdiccionFiscal", "Subtotal", "IVANoAcreditable", "ValorIVA11", "IVAPagado11",
     "ValorFronterNorte", "IVAFronteraNorte", "ValorFronteraSur", "IVAFronteraSur", 
     "ValorImportacion", "IVAImportacion", "ValorImportacionExentos", "ValorExentosIVA",
     "ValorIVA0", "ValorNoIVA", "IVARetenidoContribuyente", "IVAPagadoGastosGeneral"
@@ -38,10 +41,10 @@ def round_numeric(value: float) -> str:
 DERIVED: dict[str, Callable[[dict[str, str]], str]] = {
     #"IVA": lambda r: r.get("TOTAL", 0) * 0.16,
     "TipoTercero": lambda r: "04", # For now, all are national
-    "TipoOperacion": lambda r: "03", # For now, all are Serv Prof.
+    "TipoOperacion": lambda r: "85", # For now, all are Serv Prof.
     "RFCProveedor": lambda r: r.get("RFCProveedor", "").upper(),
-    "ValorTotal": lambda r: round_numeric(float(r.get("ValorTotal", "0"))),
-    "IVANoAcreditable": lambda r: round_numeric( int(r.get("ValorTotal", "0")) * 0.16 ),
+    "Subtotal": lambda r: round_numeric(float(r.get("ValorTotal", "0")) / (1.16) ),
+    "IVANoAcreditable": lambda r: round_numeric( int(r.get("Subtotal", "0")) * 0.16 ),
 }
 
 # Dictionary to map from metadata columns to Target
@@ -91,11 +94,41 @@ def read_metadata(input_file: Path) -> tuple[list[str], dict[str, int], list[lis
 
     return input_header, col2idx, data
 
+
+def normalize_legal_name(s: str) -> str:
+
+    # Lowercase
+    s = s.lower()
+
+    # Remove punctuation that commonly varies (periods and commas)
+    s = re.sub(r"[^\w\s&]", " ", s)
+
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def verify_name_integrity(names: list[str]) -> tuple[bool, str, str]:
+
+    # Defaults
+    name_a = ""
+    name_b = ""
+
+    for original in names:
+        for other in names:
+            if normalize_legal_name(original) != normalize_legal_name(other):
+                name_a, name_b = original, other
+                return False, name_a, name_b
+
+    return True, name_a, name_b
+
+
 # Processing logic from raw metadata into acceptable txt file.
 def process_data(input_file: Path, output_file: Path) -> None:
 
     # Read input file
-    header, col2idx, data = read_metadata(input_file)
+    header, col2idx, raw_data = read_metadata(input_file)
+    n_columns = len(header)
 
     # Make csv file path from txt one.
     output_file_txt = output_file
@@ -113,8 +146,70 @@ def process_data(input_file: Path, output_file: Path) -> None:
         # --- Write target header to csv ---
         csv_writer.writerow(TARGET_COLUMNS)
 
+        # --- Modify Amount by EfectoComprobante ---
+        modified_data = []
+        effect_indx = col2idx["EfectoComprobante"]
+        amount_indx = col2idx["Monto"]
+        for row_num, row in enumerate(raw_data):
+            # Get type
+            row_type = row[effect_indx]
+
+            if row_type == "P":
+                # Skip this kind of entries
+                continue
+
+            if row_type == "E":
+                # Make negative the Amount
+                row[amount_indx] = "-" + row[amount_indx]
+
+            # Add it to modified_data
+            modified_data.append(row)
+
+
+        # Collapse rows by RfcEmisor
+        rfc_indx = col2idx["RfcEmisor"]
+        unique_rfcs = set(row[rfc_indx] for row in raw_data)
+        rfc_to_row = {rfc: i for i, rfc in enumerate(unique_rfcs)}
+        collapsed_data = [["" for _ in range(n_columns)] for _ in range(len(unique_rfcs))]
+
+        # Values to verify integrity
+        must_be_equal_indices = [col2idx[name] for name in ["NombreEmisor"]]
+        name_sender_indx = col2idx["NombreEmisor"]
+
+        # Naive approach
+        # O(|unique_rfcs| * |modified_data|)
+        for rfc in unique_rfcs:
+            # Get row position of the rfc
+            indx = rfc_to_row[rfc]
+
+            names = []
+            subset_rows = []
+            for row_num, row in enumerate(raw_data):
+                if row[rfc_indx] != rfc:
+                    continue
+                names.append(row[name_sender_indx])
+                subset_rows.append(row)
+
+            # Verify integrity
+            correct, name_a, name_b = verify_name_integrity(names)
+            if not(correct):
+                raise ValueError(
+                    f"Name mismatch: "
+                    f"{name_a} != {name_b}"
+                )
+
+            # Pick the most frequent original per normalized key
+            most_frequent = Counter(names).most_common(1)[0][0]
+
+            # Build output
+            out = list(subset_rows[0])
+            out[name_sender_indx] = most_frequent
+            out[amount_indx] = str(sum(float(row[amount_indx]) for row in subset_rows))
+
+            collapsed_data[indx] = out
+
         # Write each row
-        for row_num, row in enumerate(data):
+        for row_num, row in enumerate(collapsed_data):
 
             # Build a dict to access fields
             row_dict = {
@@ -122,13 +217,15 @@ def process_data(input_file: Path, output_file: Path) -> None:
                 (row[idx].strip() if idx < len(row) else "") for name, idx in col2idx.items()
             }
 
+            print(row_dict)
+
             # Preprocess fields
             out_row: list[str] = []
             for col in TARGET_COLUMNS:
                 if col in DERIVED:
                     val = DERIVED[col](row_dict)
-                    if col in row_dict.keys():
-                        row_dict[col] = val
+                    # Update row_dict
+                    row_dict[col] = val
                 else:
                     # Blank cell for missing columns
                     val = row_dict.get(col, "")
