@@ -20,22 +20,6 @@ TARGET_COLUMNS: list[str] = [
     "ValorIVA0", "ValorNoIVA", "IVARetenidoContribuyente", "IVAPagadoGastosGeneral"
 ]
 
-def round_numeric(value: float) -> str:
-    #if fecha == "":
-    #    raise ValueError(f"Fecha was not provided: case({value}, {fecha})")
-
-    integer_part = math.floor(value)
-    decimal_part = value - integer_part
-
-    #year = int(fecha[:4])
-    #if year >= 2024:
-    if 0.01 <= decimal_part <= 0.50:
-        return str(integer_part)
-    elif 0.51 <= decimal_part <= 0.99:
-        return str(integer_part + 1)
-    else:
-        return str(integer_part)
-
 
 # Define the operations done for IVA calculation
 DERIVED: dict[str, Callable[[dict[str, str]], str]] = {
@@ -59,6 +43,20 @@ map_metadata_to_target: dict[str, str] = {
 unknown_derived = [c for c in DERIVED.keys() if c not in TARGET_COLUMNS]
 if unknown_derived:
     raise ValueError(f"Derived contains columns not in TARGET_COLUMNS: {unknown_derived}")
+
+def round_numeric(value: float) -> str:
+
+    integer_part = math.floor(value)
+    decimal_part = value - integer_part
+
+    #year = int(fecha[:4])
+    #if year >= 2024:
+    if 0.01 <= decimal_part <= 0.50:
+        return str(integer_part)
+    elif 0.51 <= decimal_part <= 0.99:
+        return str(integer_part + 1)
+    else:
+        return str(integer_part)
 
 
 def read_metadata(input_file: Path) -> tuple[list[str], dict[str, int], list[list[str]]]:
@@ -123,6 +121,97 @@ def verify_name_integrity(names: list[str]) -> tuple[bool, str, str]:
     return True, name_a, name_b
 
 
+def modify_amount_by_type(raw_data: list[list[str]], col2idx: dict[str, int]) -> list[list[str]]:
+    """
+    Change Monto value based on EfectoComprobante.
+    Let v = row["Monto"]
+    Let x = row["EfectoComprobante"]
+    if x == "P": continue
+    if x == "E": -v
+    """
+
+    # Make empty list
+    modified_data = []
+
+    # Get row indices
+    effect_indx = col2idx["EfectoComprobante"]
+    amount_indx = col2idx["Monto"]
+
+    for row_num, row in enumerate(raw_data):
+        # Get type
+        row_type = row[effect_indx]
+
+        #if row_type == "P":
+            # Skip this kind of entries
+        #    continue
+
+        if row_type == "E":
+            # Make negative the Amount
+            row[amount_indx] = "-" + row[amount_indx]
+
+        # Add it to modified_data
+        modified_data.append(row)
+
+    return modified_data 
+
+
+def collapse_rows(data: list[list[str]], col2idx: dict[str, int], n_columns: int) -> list[list[str]]:
+    """
+    Collapse rows by RfcEmisor
+    """
+
+    # Get required indices
+    rfc_indx = col2idx["RfcEmisor"]
+
+    # Get all unique rfcs
+    unique_rfcs = set(row[rfc_indx] for row in data)
+
+    # Make a row index mapping based on rfcs
+    rfc_to_row = {rfc: i for i, rfc in enumerate(unique_rfcs)}
+
+    # Prepare structure for output
+    collapsed_data = [["" for _ in range(n_columns)] for _ in range(len(unique_rfcs))]
+
+    # Values to verify integrity
+    #must_be_equal_indices = [col2idx[name] for name in ["NombreEmisor"]]
+    amount_indx = col2idx["Monto"]
+    name_sender_indx = col2idx["NombreEmisor"]
+
+    # Naive approach
+    # O(|unique_rfcs| * |modified_data|)
+    for rfc in unique_rfcs:
+        # Get row position of the rfc
+        indx = rfc_to_row[rfc]
+
+        names = []
+        subset_rows = []
+        for row_num, row in enumerate(data):
+            if row[rfc_indx] != rfc:
+                continue
+            names.append(row[name_sender_indx])
+            subset_rows.append(row)
+
+        # Verify integrity
+        correct, name_a, name_b = verify_name_integrity(names)
+        if not(correct):
+            raise ValueError(
+                f"Name mismatch: "
+                f"{name_a} != {name_b}"
+            )
+
+        # Pick the most frequent original per normalized key
+        most_frequent = Counter(names).most_common(1)[0][0]
+
+        # Build output
+        out = list(subset_rows[0])
+        out[name_sender_indx] = most_frequent
+        out[amount_indx] = str(sum(float(row[amount_indx]) for row in subset_rows))
+
+        collapsed_data[indx] = out
+
+    return collapsed_data
+
+
 # Processing logic from raw metadata into acceptable txt file.
 def process_data(input_file: Path, output_file: Path) -> None:
 
@@ -130,11 +219,32 @@ def process_data(input_file: Path, output_file: Path) -> None:
     header, col2idx, raw_data = read_metadata(input_file)
     n_columns = len(header)
 
-    # Make csv file path from txt one.
+    # Preprocess data
+    # --- Modify Amount by EfectoComprobante ---
+    modified_data = modify_amount_by_type(raw_data, col2idx)
+
+    # --- Collapse rows by rfc ---
+    collapsed_data = collapse_rows(modified_data, col2idx, n_columns)
+
+    # --- Write raw metadata as a csv ---
+    metadata_filename = output_file.parent / "clean_metadata.csv"
+    with open(metadata_filename, "w", encoding="utf-8", newline="") as f:
+
+        # Make writer object
+        writer = csv.writer(f, delimiter=",", lineterminator="\n")
+
+        # Write header
+        writer.writerow(header)
+
+        # Write rows
+        for row in modified_data:
+            writer.writerow(row)
+        f.close()
+
+    # --- Write collapsed data as txt and csv ---
+    ## Make csv file path from txt one.
     output_file_txt = output_file
     output_file_csv = output_file.with_suffix(".csv")
-
-    # Write files
     with (
         open(output_file_txt, "w", encoding="utf-8", newline="") as f_txt,
         open(output_file_csv, "w", encoding="utf-8", newline="") as f_csv
@@ -146,68 +256,6 @@ def process_data(input_file: Path, output_file: Path) -> None:
         # --- Write target header to csv ---
         csv_writer.writerow(TARGET_COLUMNS)
 
-        # --- Modify Amount by EfectoComprobante ---
-        modified_data = []
-        effect_indx = col2idx["EfectoComprobante"]
-        amount_indx = col2idx["Monto"]
-        for row_num, row in enumerate(raw_data):
-            # Get type
-            row_type = row[effect_indx]
-
-            if row_type == "P":
-                # Skip this kind of entries
-                continue
-
-            if row_type == "E":
-                # Make negative the Amount
-                row[amount_indx] = "-" + row[amount_indx]
-
-            # Add it to modified_data
-            modified_data.append(row)
-
-
-        # Collapse rows by RfcEmisor
-        rfc_indx = col2idx["RfcEmisor"]
-        unique_rfcs = set(row[rfc_indx] for row in raw_data)
-        rfc_to_row = {rfc: i for i, rfc in enumerate(unique_rfcs)}
-        collapsed_data = [["" for _ in range(n_columns)] for _ in range(len(unique_rfcs))]
-
-        # Values to verify integrity
-        must_be_equal_indices = [col2idx[name] for name in ["NombreEmisor"]]
-        name_sender_indx = col2idx["NombreEmisor"]
-
-        # Naive approach
-        # O(|unique_rfcs| * |modified_data|)
-        for rfc in unique_rfcs:
-            # Get row position of the rfc
-            indx = rfc_to_row[rfc]
-
-            names = []
-            subset_rows = []
-            for row_num, row in enumerate(raw_data):
-                if row[rfc_indx] != rfc:
-                    continue
-                names.append(row[name_sender_indx])
-                subset_rows.append(row)
-
-            # Verify integrity
-            correct, name_a, name_b = verify_name_integrity(names)
-            if not(correct):
-                raise ValueError(
-                    f"Name mismatch: "
-                    f"{name_a} != {name_b}"
-                )
-
-            # Pick the most frequent original per normalized key
-            most_frequent = Counter(names).most_common(1)[0][0]
-
-            # Build output
-            out = list(subset_rows[0])
-            out[name_sender_indx] = most_frequent
-            out[amount_indx] = str(sum(float(row[amount_indx]) for row in subset_rows))
-
-            collapsed_data[indx] = out
-
         # Write each row
         for row_num, row in enumerate(collapsed_data):
 
@@ -217,9 +265,9 @@ def process_data(input_file: Path, output_file: Path) -> None:
                 (row[idx].strip() if idx < len(row) else "") for name, idx in col2idx.items()
             }
 
-            print(row_dict)
+            #print(row_dict)
 
-            # Preprocess fields
+            # Operations on fields
             out_row: list[str] = []
             for col in TARGET_COLUMNS:
                 if col in DERIVED:
